@@ -140,6 +140,7 @@ describe('buildSimpleWorkflow - checkpoint', () => {
 
     // 负面与潜空间
     expect(node(wf, '4').class_type).toBe('CLIPTextEncode');
+    expect(node(wf, '4').inputs.text).toContain('illegible text, gibberish lettering');
     expect(node(wf, '5').class_type).toBe('EmptyLatentImage');
     expect(node(wf, '5').inputs).toMatchObject({ width: 832, height: 1216 });
 
@@ -201,6 +202,44 @@ describe('buildSimpleWorkflow - checkpoint', () => {
     // 解码与存图
     expect(node(wf, '7').class_type).toBe('VAEDecode');
     expect(node(wf, '8').class_type).toBe('SaveImage');
+  });
+
+  it('包含文字槽位(text item)时自动引导生成空白对话气泡且全局增加 empty speech bubbles 提示', () => {
+    const layoutPromptWithText = JSON.stringify({
+      summary: {
+        caption: 'Page frame guide: panel 1. Visible lettering follows supplied text.',
+        canvas: 'single',
+      },
+      items: [
+        {
+          label: 'character',
+          caption: 'Content of panel 1: 1girl sitting by cafe window',
+          bbox: [-400, -300, 400, 300],
+        },
+        {
+          label: 'text',
+          text: '今天天气真好呢。',
+          caption: 'Black printed Chinese lettering.',
+          bbox: [-500, 100, -350, 300],
+        },
+      ],
+      bbox_coord_space: 'abs_centralized',
+      bbox_format: 'yxyx',
+    });
+
+    const wf = buildSimpleWorkflow(simple, {
+      ...VALUES,
+      prompt: layoutPromptWithText,
+      width: 832,
+      height: 1216,
+    });
+
+    // 全局正向提示词包含 empty speech bubbles
+    expect(node(wf, '3').inputs.text).toContain('empty speech bubbles, comic dialogue balloons');
+    // text 对应区域的 prompt 自动转为空白对话气泡提示
+    const textRegionNode = node(wf, '1014');
+    expect(textRegionNode.class_type).toBe('CLIPTextEncode');
+    expect(textRegionNode.inputs.text).toContain('empty speech bubble, blank comic dialogue balloon');
   });
 });
 

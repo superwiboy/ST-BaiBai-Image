@@ -273,6 +273,7 @@ export interface MangaRegionItem {
 export interface ParsedMangaLayout {
   summary?: { caption?: string; canvas?: string };
   regions: MangaRegionItem[];
+  hasText?: boolean;
 }
 
 export function cleanSummaryCaption(caption?: string): string {
@@ -280,6 +281,10 @@ export function cleanSummaryCaption(caption?: string): string {
   return caption
     .replace(/Page frame guide:[\s\S]*?All frame coordinates below are centered pixels\.\s*/i, '')
     .replace(/Frame guide for the listed regions:[\s\S]*?All frame coordinates below are centered pixels\.\s*/i, '')
+    .replace(/Reading sequence:[\s\S]*?sequence\.\s*/gi, '')
+    .replace(/Stacking:[\s\S]*?panels\.\s*/gi, '')
+    .replace(/Each item belongs to its named panel[\s\S]*?lettering\.\s*/gi, '')
+    .replace(/Visible lettering follows[\s\S]*?visible\.\s*/gi, '')
     .replace(/panel \d+[^.]*\.\s*/gi, '')
     .trim();
 }
@@ -312,6 +317,7 @@ export function tryParseMangaLayout(text: string, canvasW?: number, canvasH?: nu
   const height = canvasH && canvasH > 0 ? canvasH : 1216;
 
   const boxGroups = new Map<string, { x: number; y: number; w: number; h: number; prompts: string[] }>();
+  let hasText = false;
 
   for (const item of parsed.items) {
     if (!item || typeof item !== 'object' || !Array.isArray(item.bbox) || item.bbox.length !== 4) continue;
@@ -328,9 +334,17 @@ export function tryParseMangaLayout(text: string, canvasW?: number, canvasH?: nu
     const pw = Math.max(1, Math.min(width - px, Math.round(Math.abs(right - left))));
     const ph = Math.max(1, Math.min(height - py, Math.round(Math.abs(bottom - top))));
 
-    const promptText = cleanPanelCaption(item.caption);
-    const tags = Array.isArray(item.tags) ? item.tags.filter((t: unknown) => typeof t === 'string' && t.trim()).join(', ') : '';
-    const itemPrompt = joinParts(promptText, tags);
+    const isTextItem = item.label === 'text' || Boolean(item.text) || /lettering|speech bubble|dialogue/i.test(item.caption ?? '');
+    if (isTextItem) hasText = true;
+
+    let itemPrompt = '';
+    if (isTextItem) {
+      itemPrompt = 'empty speech bubble, blank comic dialogue balloon, clean speech bubble, white speech bubble, no text inside';
+    } else {
+      const promptText = cleanPanelCaption(item.caption);
+      const tags = Array.isArray(item.tags) ? item.tags.filter((t: unknown) => typeof t === 'string' && t.trim()).join(', ') : '';
+      itemPrompt = joinParts(promptText, tags);
+    }
 
     const key = `${px}:${py}:${pw}:${ph}`;
     const existing = boxGroups.get(key);
@@ -357,6 +371,7 @@ export function tryParseMangaLayout(text: string, canvasW?: number, canvasH?: nu
   return {
     summary: parsed.summary,
     regions,
+    hasText,
   };
 }
 
@@ -472,19 +487,24 @@ function buildCheckpointRegionalWorkflow(
   const clipRef: NodeRef = chain.clip ?? ['1', 1];
   const baseScene = cleanSummaryCaption(layout.summary?.caption);
   const layoutTag = layout.regions.length > 1
-    ? `${layout.regions.length}-panel manga page layout, comic panels, black borders separating panels`
+    ? `${layout.regions.length}-panel manga page layout, comic panels, black borders separating panels, white gutters`
     : '';
-  const globalPrompt = joinParts(simple.positive, joinParts(layoutTag, baseScene || (values.nl ?? '').trim() || 'masterpiece, best quality'));
+  const bubbleTag = layout.hasText ? 'empty speech bubbles, comic dialogue balloons' : '';
+  const globalPrompt = joinParts(simple.positive, joinParts(layoutTag, joinParts(bubbleTag, baseScene || (values.nl ?? '').trim() || 'masterpiece, best quality')));
 
   // 全局底正向提示词
   nodes['3'] = {
     class_type: 'CLIPTextEncode',
     inputs: { text: globalPrompt, clip: clipRef },
   };
-  // 全局负向提示词
+  // 全局负向提示词 (硬化抑制乱码符文)
+  const regionalNegative = joinParts(
+    composeNegative(simple, values),
+    'illegible text, gibberish lettering, distorted characters, bad typography, blurry text',
+  );
   nodes['4'] = {
     class_type: 'CLIPTextEncode',
-    inputs: { text: composeNegative(simple, values), clip: clipRef },
+    inputs: { text: regionalNegative, clip: clipRef },
   };
   // 潜空间画布
   nodes['5'] = {
