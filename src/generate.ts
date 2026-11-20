@@ -31,6 +31,7 @@ import { acquireNaiSlot } from '@/floor/genQueue';
 import type { GenerationMeta } from '@/generationMeta';
 import { activeComfyPreset, activeNaiEndpoint, activeOrientationLock, effectiveComfyConn, effectiveNai, settings, type BackendId } from '@/state/settings';
 import { applyMangaFrames } from '@/manga/layouts';
+import { applyMangaLettering } from '@/manga/lettering';
 
 /** 一次生成的输入。与协议层 ImageInsertion 同形,但不含正文位置信息。 */
 export interface GenerateInput {
@@ -226,11 +227,19 @@ export async function generateImage(
         signal,
         { onQueue: ahead => progress.onQueue?.(ahead) },
       );
-      // ComfyUI 没有运行期跳过的概念，配方全在预设里，可在此直接快照。
       // 尺寸解析口径与 generateComfyImage 一致（未解析出时 0 = 用工作流自带尺寸）。
       const px = parseSize(pickSize(conn, size));
       const width = px?.width ?? 0;
       const height = px?.height ?? 0;
+
+      // 漫画模式台词嵌字：在包含文本项时将文字以漫画标准排版矢量嵌印入气泡
+      const lettered = await applyMangaLettering(result.url, mangaPrompt, width, height);
+      if (lettered) {
+        result.revoke();
+        result = { ...result, url: lettered.url, revoke: () => URL.revokeObjectURL(lettered.url) };
+      }
+
+      // ComfyUI 没有运行期跳过的概念，配方全在预设里，可在此直接快照。
       const simpleValues: SimpleGenValues = {
         prompt: mangaPrompt,
         nl: mangaNl,

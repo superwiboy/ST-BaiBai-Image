@@ -315,54 +315,80 @@ export function tryParseMangaLayout(text: string, canvasW?: number, canvasH?: nu
   const isCentralized = parsed.bbox_coord_space === 'abs_centralized';
   const width = canvasW && canvasW > 0 ? canvasW : 832;
   const height = canvasH && canvasH > 0 ? canvasH : 1216;
+  const align8 = (v: number) => Math.round(v / 8) * 8;
 
-  const boxGroups = new Map<string, { x: number; y: number; w: number; h: number; prompts: string[] }>();
+  // 按 panel 聚合：格内人物、气泡、背景融为一体，杜绝子槽位切碎导致格内核内被边框遮挡
+  const panelGroups = new Map<string, {
+    y1: number;
+    x1: number;
+    y2: number;
+    x2: number;
+    prompts: string[];
+    hasBubble: boolean;
+  }>();
+
   let hasText = false;
 
-  for (const item of parsed.items) {
+  for (let i = 0; i < parsed.items.length; i++) {
+    const item = parsed.items[i];
     if (!item || typeof item !== 'object' || !Array.isArray(item.bbox) || item.bbox.length !== 4) continue;
     const [y1, x1, y2, x2] = item.bbox;
     if (![y1, x1, y2, x2].every((v: unknown) => typeof v === 'number' && Number.isFinite(v))) continue;
 
-    const left = isCentralized ? x1 + width / 2 : x1;
-    const top = isCentralized ? y1 + height / 2 : y1;
-    const right = isCentralized ? x2 + width / 2 : x2;
-    const bottom = isCentralized ? y2 + height / 2 : y2;
-
-    const px = Math.max(0, Math.min(width - 1, Math.round(Math.min(left, right))));
-    const py = Math.max(0, Math.min(height - 1, Math.round(Math.min(top, bottom))));
-    const pw = Math.max(1, Math.min(width - px, Math.round(Math.abs(right - left))));
-    const ph = Math.max(1, Math.min(height - py, Math.round(Math.abs(bottom - top))));
-
     const isTextItem = item.label === 'text' || Boolean(item.text) || /lettering|speech bubble|dialogue/i.test(item.caption ?? '');
     if (isTextItem) hasText = true;
 
-    let itemPrompt = '';
-    if (isTextItem) {
-      itemPrompt = 'empty speech bubble, blank comic dialogue balloon, clean speech bubble, white speech bubble, no text inside';
-    } else {
-      const promptText = cleanPanelCaption(item.caption);
-      const tags = Array.isArray(item.tags) ? item.tags.filter((t: unknown) => typeof t === 'string' && t.trim()).join(', ') : '';
-      itemPrompt = joinParts(promptText, tags);
-    }
+    const panelMatch = typeof item.caption === 'string' ? item.caption.match(/panel\s+(\d+)/i) : null;
+    const groupKey = parsed.summary?.canvas === 'single'
+      ? 'single'
+      : (item.panel != null ? String(item.panel) : (panelMatch ? panelMatch[1] : `item_${i}`));
+    const existing = panelGroups.get(groupKey);
 
-    const key = `${px}:${py}:${pw}:${ph}`;
-    const existing = boxGroups.get(key);
+    const promptText = isTextItem ? '' : cleanPanelCaption(item.caption);
+    const tags = Array.isArray(item.tags) ? item.tags.filter((t: unknown) => typeof t === 'string' && t.trim()).join(', ') : '';
+    const itemPrompt = joinParts(promptText, tags);
+
     if (existing) {
+      existing.y1 = Math.min(existing.y1, y1);
+      existing.x1 = Math.min(existing.x1, x1);
+      existing.y2 = Math.max(existing.y2, y2);
+      existing.x2 = Math.max(existing.x2, x2);
       if (itemPrompt) existing.prompts.push(itemPrompt);
+      if (isTextItem) existing.hasBubble = true;
     } else {
-      boxGroups.set(key, { x: px, y: py, w: pw, h: ph, prompts: itemPrompt ? [itemPrompt] : [] });
+      panelGroups.set(groupKey, {
+        y1,
+        x1,
+        y2,
+        x2,
+        prompts: itemPrompt ? [itemPrompt] : [],
+        hasBubble: isTextItem,
+      });
     }
   }
 
   const regions: MangaRegionItem[] = [];
-  for (const group of boxGroups.values()) {
+  for (const group of panelGroups.values()) {
+    const left = isCentralized ? group.x1 + width / 2 : group.x1;
+    const top = isCentralized ? group.y1 + height / 2 : group.y1;
+    const right = isCentralized ? group.x2 + width / 2 : group.x2;
+    const bottom = isCentralized ? group.y2 + height / 2 : group.y2;
+
+    const px = Math.max(0, align8(Math.min(left, right)));
+    const py = Math.max(0, align8(Math.min(top, bottom)));
+    const pw = Math.max(8, Math.min(width - px, align8(Math.abs(right - left))));
+    const ph = Math.max(8, Math.min(height - py, align8(Math.abs(bottom - top))));
+
+    const panelBasePrompt = group.prompts.join(', ') || 'masterpiece, best quality';
+    const bubblePrompt = group.hasBubble ? 'empty speech bubble, comic dialogue balloon, clean speech bubble' : '';
+    const fullPanelPrompt = joinParts(panelBasePrompt, bubblePrompt);
+
     regions.push({
-      x: group.x,
-      y: group.y,
-      w: group.w,
-      h: group.h,
-      prompt: group.prompts.join(', ') || 'masterpiece, best quality',
+      x: px,
+      y: py,
+      w: pw,
+      h: ph,
+      prompt: fullPanelPrompt,
     });
   }
 
@@ -487,7 +513,7 @@ function buildCheckpointRegionalWorkflow(
   const clipRef: NodeRef = chain.clip ?? ['1', 1];
   const baseScene = cleanSummaryCaption(layout.summary?.caption);
   const layoutTag = layout.regions.length > 1
-    ? `${layout.regions.length}-panel manga page layout, comic panels, black borders separating panels, white gutters`
+    ? `${layout.regions.length}-panel manga page layout, clean comic framing, white gutter spacing`
     : '';
   const bubbleTag = layout.hasText ? 'empty speech bubbles, comic dialogue balloons' : '';
   const globalPrompt = joinParts(simple.positive, joinParts(layoutTag, joinParts(bubbleTag, baseScene || (values.nl ?? '').trim() || 'masterpiece, best quality')));

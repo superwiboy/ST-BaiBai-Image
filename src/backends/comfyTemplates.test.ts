@@ -236,10 +236,12 @@ describe('buildSimpleWorkflow - checkpoint', () => {
 
     // 全局正向提示词包含 empty speech bubbles
     expect(node(wf, '3').inputs.text).toContain('empty speech bubbles, comic dialogue balloons');
-    // text 对应区域的 prompt 自动转为空白对话气泡提示
-    const textRegionNode = node(wf, '1014');
-    expect(textRegionNode.class_type).toBe('CLIPTextEncode');
-    expect(textRegionNode.inputs.text).toContain('empty speech bubble, blank comic dialogue balloon');
+    // panel 内合并了角色与文字槽位，自动注入空白气泡引导，且整体聚合为一个统一 panel (1004)
+    const panelRegionNode = node(wf, '1004');
+    expect(panelRegionNode.class_type).toBe('CLIPTextEncode');
+    expect(panelRegionNode.inputs.text).toContain('empty speech bubble, comic dialogue balloon');
+    // 不再产生孤立切碎的第二格区域
+    expect(wf['1014']).toBeUndefined();
   });
 });
 
