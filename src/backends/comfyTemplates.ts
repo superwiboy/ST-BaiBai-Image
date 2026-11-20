@@ -262,6 +262,104 @@ export interface SimpleGenValues {
   height: number;
 }
 
+export interface MangaRegionItem {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  prompt: string;
+}
+
+export interface ParsedMangaLayout {
+  summary?: { caption?: string; canvas?: string };
+  regions: MangaRegionItem[];
+}
+
+export function cleanSummaryCaption(caption?: string): string {
+  if (!caption) return '';
+  return caption
+    .replace(/Page frame guide:[\s\S]*?All frame coordinates below are centered pixels\.\s*/i, '')
+    .replace(/Frame guide for the listed regions:[\s\S]*?All frame coordinates below are centered pixels\.\s*/i, '')
+    .replace(/panel \d+[^.]*\.\s*/gi, '')
+    .trim();
+}
+
+export function cleanPanelCaption(caption?: string): string {
+  if (!caption) return '';
+  return caption
+    .replace(/^Content of panel \d+:\s*/i, '')
+    .replace(/Text \d+ of \d+ in this region[^.]*\.\s*/gi, '')
+    .replace(/Placement:[\s\S]*?text region\.\s*/gi, '')
+    .replace(/Composition guide:[\s\S]*?not lettering\.\s*/gi, '')
+    .trim();
+}
+
+export function tryParseMangaLayout(text: string, canvasW?: number, canvasH?: number): ParsedMangaLayout | null {
+  const trimmed = text.trim();
+  if (!trimmed.startsWith('{') || !trimmed.endsWith('}')) return null;
+  let parsed: any;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== 'object' || !Array.isArray(parsed.items) || parsed.items.length === 0) {
+    return null;
+  }
+
+  const isCentralized = parsed.bbox_coord_space === 'abs_centralized';
+  const width = canvasW && canvasW > 0 ? canvasW : 832;
+  const height = canvasH && canvasH > 0 ? canvasH : 1216;
+
+  const boxGroups = new Map<string, { x: number; y: number; w: number; h: number; prompts: string[] }>();
+
+  for (const item of parsed.items) {
+    if (!item || typeof item !== 'object' || !Array.isArray(item.bbox) || item.bbox.length !== 4) continue;
+    const [y1, x1, y2, x2] = item.bbox;
+    if (![y1, x1, y2, x2].every((v: unknown) => typeof v === 'number' && Number.isFinite(v))) continue;
+
+    const left = isCentralized ? x1 + width / 2 : x1;
+    const top = isCentralized ? y1 + height / 2 : y1;
+    const right = isCentralized ? x2 + width / 2 : x2;
+    const bottom = isCentralized ? y2 + height / 2 : y2;
+
+    const px = Math.max(0, Math.min(width - 1, Math.round(Math.min(left, right))));
+    const py = Math.max(0, Math.min(height - 1, Math.round(Math.min(top, bottom))));
+    const pw = Math.max(1, Math.min(width - px, Math.round(Math.abs(right - left))));
+    const ph = Math.max(1, Math.min(height - py, Math.round(Math.abs(bottom - top))));
+
+    const promptText = cleanPanelCaption(item.caption);
+    const tags = Array.isArray(item.tags) ? item.tags.filter((t: unknown) => typeof t === 'string' && t.trim()).join(', ') : '';
+    const itemPrompt = joinParts(promptText, tags);
+
+    const key = `${px}:${py}:${pw}:${ph}`;
+    const existing = boxGroups.get(key);
+    if (existing) {
+      if (itemPrompt) existing.prompts.push(itemPrompt);
+    } else {
+      boxGroups.set(key, { x: px, y: py, w: pw, h: ph, prompts: itemPrompt ? [itemPrompt] : [] });
+    }
+  }
+
+  const regions: MangaRegionItem[] = [];
+  for (const group of boxGroups.values()) {
+    regions.push({
+      x: group.x,
+      y: group.y,
+      w: group.w,
+      h: group.h,
+      prompt: group.prompts.join(', ') || 'masterpiece, best quality',
+    });
+  }
+
+  if (regions.length === 0) return null;
+
+  return {
+    summary: parsed.summary,
+    regions,
+  };
+}
+
 /** 逗号拼接非空片段。 */
 function joinParts(...parts: (string | undefined)[]): string {
   return parts.map(part => (part ?? '').trim()).filter(Boolean).join(', ');
@@ -269,9 +367,15 @@ function joinParts(...parts: (string | undefined)[]): string {
 
 /**
  * 正向 = 固定正面 + 生成内容;生成内容有 nl 优先用 nl(Flux/Anima 吃自然语言),
- * 没有才退回短 tag。开关在预设上,用户自己决定模板与开关的搭配。
+ * 没有才退回短 tag。若为分格版式 JSON,则提取全局场景与各分格描述展示。
  */
 export function composePositive(simple: ComfySimpleConfig, values: SimpleGenValues): string {
+  const layout = tryParseMangaLayout(values.prompt, values.width, values.height);
+  if (layout && layout.regions.length > 0) {
+    const base = cleanSummaryCaption(layout.summary?.caption);
+    const panelsDesc = layout.regions.map((r, i) => `[Panel ${i + 1}] ${r.prompt}`).join(' | ');
+    return joinParts(simple.positive, joinParts(base, panelsDesc));
+  }
   return joinParts(simple.positive, (values.nl ?? '').trim() || values.prompt);
 }
 
@@ -357,6 +461,119 @@ function saveNode(images: NodeRef): SimpleWorkflowNode {
   return { class_type: 'SaveImage', inputs: { filename_prefix: 'BaiBai', images } };
 }
 
+function buildCheckpointRegionalWorkflow(
+  nodes: SimpleWorkflow,
+  chain: { model: NodeRef; clip: NodeRef | null },
+  externalVae: string,
+  simple: ComfySimpleConfig,
+  values: SimpleGenValues,
+  layout: ParsedMangaLayout,
+): SimpleWorkflow {
+  const clipRef: NodeRef = chain.clip ?? ['1', 1];
+  const baseScene = cleanSummaryCaption(layout.summary?.caption);
+  const layoutTag = layout.regions.length > 1
+    ? `${layout.regions.length}-panel manga page layout, comic panels, black borders separating panels`
+    : '';
+  const globalPrompt = joinParts(simple.positive, joinParts(layoutTag, baseScene || (values.nl ?? '').trim() || 'masterpiece, best quality'));
+
+  // 全局底正向提示词
+  nodes['3'] = {
+    class_type: 'CLIPTextEncode',
+    inputs: { text: globalPrompt, clip: clipRef },
+  };
+  // 全局负向提示词
+  nodes['4'] = {
+    class_type: 'CLIPTextEncode',
+    inputs: { text: composeNegative(simple, values), clip: clipRef },
+  };
+  // 潜空间画布
+  nodes['5'] = {
+    class_type: 'EmptyLatentImage',
+    inputs: { width: values.width, height: values.height, batch_size: 1 },
+  };
+
+  let currentPositive: NodeRef = ['3', 0];
+
+  layout.regions.forEach((region, i) => {
+    const baseMaskId = `10${i}1`;
+    const panelMaskId = `10${i}2`;
+    const compMaskId = `10${i}3`;
+    const textNodeId = `10${i}4`;
+    const setMaskId = `10${i}5`;
+    const combineId = `10${i}6`;
+
+    // 1. 全图全黑底 mask (画布尺寸)
+    nodes[baseMaskId] = {
+      class_type: 'SolidMask',
+      inputs: { value: 0.0, width: values.width, height: values.height },
+    };
+    // 2. 当前分格全白 mask (分格区域尺寸)
+    nodes[panelMaskId] = {
+      class_type: 'SolidMask',
+      inputs: { value: 1.0, width: region.w, height: region.h },
+    };
+    // 3. 贴图合成 (Composite):将白色分格 mask 合成到全黑底指定坐标 (x, y)
+    nodes[compMaskId] = {
+      class_type: 'MaskComposite',
+      inputs: {
+        destination: [baseMaskId, 0],
+        source: [panelMaskId, 0],
+        x: region.x,
+        y: region.y,
+        operation: 'add',
+      },
+    };
+    // 4. 分格独立正向提示词编码
+    nodes[textNodeId] = {
+      class_type: 'CLIPTextEncode',
+      inputs: { text: region.prompt, clip: clipRef },
+    };
+    // 5. 区域条件绑定 (ConditioningSetMask, set_cond_area: mask bounds)
+    nodes[setMaskId] = {
+      class_type: 'ConditioningSetMask',
+      inputs: {
+        conditioning: [textNodeId, 0],
+        mask: [compMaskId, 0],
+        strength: 1.0,
+        set_cond_area: 'mask bounds',
+      },
+    };
+    // 6. 汇入正向条件链 (ConditioningCombine)
+    nodes[combineId] = {
+      class_type: 'ConditioningCombine',
+      inputs: {
+        conditioning_1: currentPositive,
+        conditioning_2: [setMaskId, 0],
+      },
+    };
+
+    currentPositive = [combineId, 0];
+  });
+
+  // 采样器:positive 接入分格结合后的完整 conditioning 链尾
+  nodes['6'] = {
+    class_type: 'KSampler',
+    inputs: {
+      seed: values.seed,
+      steps: simple.steps,
+      cfg: simple.cfg,
+      sampler_name: simple.sampler,
+      scheduler: simple.scheduler,
+      denoise: 1,
+      model: chain.model,
+      positive: currentPositive,
+      negative: ['4', 0],
+      latent_image: ['5', 0],
+    },
+  };
+  nodes['7'] = {
+    class_type: 'VAEDecode',
+    inputs: { samples: ['6', 0], vae: externalVae ? ['2', 0] : ['1', 2] },
+  };
+  nodes['8'] = saveNode(['7', 0]);
+  return nodes;
+}
+
 function buildCheckpointWorkflow(simple: ComfySimpleConfig, values: SimpleGenValues): SimpleWorkflow {
   const nodes: SimpleWorkflow = {};
   nodes['1'] = { class_type: 'CheckpointLoaderSimple', inputs: { ckpt_name: simple.model.trim() } };
@@ -364,6 +581,11 @@ function buildCheckpointWorkflow(simple: ComfySimpleConfig, values: SimpleGenVal
   if (externalVae) nodes['2'] = { class_type: 'VAELoader', inputs: { vae_name: externalVae } };
 
   const chain = applyLoras(nodes, simple.loras, false, ['1', 0], ['1', 1]);
+
+  const layout = tryParseMangaLayout(values.prompt, values.width, values.height);
+  if (layout && layout.regions.length > 0) {
+    return buildCheckpointRegionalWorkflow(nodes, chain, externalVae, simple, values, layout);
+  }
 
   nodes['3'] = {
     class_type: 'CLIPTextEncode',

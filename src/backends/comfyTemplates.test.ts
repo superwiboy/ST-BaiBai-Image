@@ -102,6 +102,106 @@ describe('buildSimpleWorkflow - checkpoint', () => {
     expect(node(wf, '3').inputs.clip).toEqual(['301', 1]);
     expect(wf['302']).toBeUndefined();
   });
+
+  it('分格版式 JSON 输入时自动生成 Checkpoint/Illustrious 区域分格工作流 (ConditioningSetMask + MaskComposite)', () => {
+    const layoutPrompt = JSON.stringify({
+      summary: {
+        caption: 'Page frame guide: panel 1; panel 2. A rainy evening inside an apartment.',
+        canvas: 'multi_panel',
+      },
+      items: [
+        {
+          label: 'character',
+          caption: 'Content of panel 1: 1girl, standing by window, looking at viewer',
+          bbox: [-608, -416, 0, 416],
+        },
+        {
+          label: 'character',
+          caption: 'Content of panel 2: 1boy, lying on bed, resting',
+          bbox: [0, -416, 608, 416],
+        },
+      ],
+      bbox_coord_space: 'abs_centralized',
+      bbox_format: 'yxyx',
+    });
+
+    const wf = buildSimpleWorkflow(simple, {
+      ...VALUES,
+      prompt: layoutPrompt,
+      width: 832,
+      height: 1216,
+    });
+
+    // 基础加载与底模链路正常
+    expect(node(wf, '1').class_type).toBe('CheckpointLoaderSimple');
+    expect(node(wf, '3').class_type).toBe('CLIPTextEncode');
+    expect(node(wf, '3').inputs.text).toContain('2-panel manga page layout');
+    expect(node(wf, '3').inputs.text).toContain('A rainy evening inside an apartment.');
+
+    // 负面与潜空间
+    expect(node(wf, '4').class_type).toBe('CLIPTextEncode');
+    expect(node(wf, '5').class_type).toBe('EmptyLatentImage');
+    expect(node(wf, '5').inputs).toMatchObject({ width: 832, height: 1216 });
+
+    // Panel 1 (上格) 区域节点
+    expect(node(wf, '1001').class_type).toBe('SolidMask');
+    expect(node(wf, '1001').inputs).toMatchObject({ value: 0, width: 832, height: 1216 });
+    expect(node(wf, '1002').class_type).toBe('SolidMask');
+    expect(node(wf, '1002').inputs).toMatchObject({ value: 1, width: 832, height: 608 });
+    expect(node(wf, '1003').class_type).toBe('MaskComposite');
+    expect(node(wf, '1003').inputs).toMatchObject({
+      destination: ['1001', 0],
+      source: ['1002', 0],
+      x: 0,
+      y: 0,
+      operation: 'add',
+    });
+    expect(node(wf, '1004').class_type).toBe('CLIPTextEncode');
+    expect(node(wf, '1004').inputs.text).toBe('1girl, standing by window, looking at viewer');
+    expect(node(wf, '1005').class_type).toBe('ConditioningSetMask');
+    expect(node(wf, '1005').inputs).toMatchObject({
+      conditioning: ['1004', 0],
+      mask: ['1003', 0],
+      strength: 1.0,
+      set_cond_area: 'mask bounds',
+    });
+    expect(node(wf, '1006').class_type).toBe('ConditioningCombine');
+    expect(node(wf, '1006').inputs).toMatchObject({
+      conditioning_1: ['3', 0],
+      conditioning_2: ['1005', 0],
+    });
+
+    // Panel 2 (下格) 区域节点
+    expect(node(wf, '1011').class_type).toBe('SolidMask');
+    expect(node(wf, '1012').class_type).toBe('SolidMask');
+    expect(node(wf, '1012').inputs).toMatchObject({ value: 1, width: 832, height: 608 });
+    expect(node(wf, '1013').class_type).toBe('MaskComposite');
+    expect(node(wf, '1013').inputs).toMatchObject({
+      destination: ['1011', 0],
+      source: ['1012', 0],
+      x: 0,
+      y: 608,
+      operation: 'add',
+    });
+    expect(node(wf, '1014').class_type).toBe('CLIPTextEncode');
+    expect(node(wf, '1014').inputs.text).toBe('1boy, lying on bed, resting');
+    expect(node(wf, '1015').class_type).toBe('ConditioningSetMask');
+    expect(node(wf, '1016').class_type).toBe('ConditioningCombine');
+    expect(node(wf, '1016').inputs).toMatchObject({
+      conditioning_1: ['1006', 0],
+      conditioning_2: ['1015', 0],
+    });
+
+    // KSampler 正向汇聚于最后一路 combine (1016)
+    expect(node(wf, '6').class_type).toBe('KSampler');
+    expect(node(wf, '6').inputs.positive).toEqual(['1016', 0]);
+    expect(node(wf, '6').inputs.negative).toEqual(['4', 0]);
+    expect(node(wf, '6').inputs.latent_image).toEqual(['5', 0]);
+
+    // 解码与存图
+    expect(node(wf, '7').class_type).toBe('VAEDecode');
+    expect(node(wf, '8').class_type).toBe('SaveImage');
+  });
 });
 
 describe('buildSimpleWorkflow - flux', () => {
